@@ -1,0 +1,103 @@
+name: Release
+
+# Compila la app (código privado) para macOS y Windows y publica los instaladores y latest.json aquí.
+# Se lanza a mano (scripts/release.sh del repo privado o desde la pestaña Actions).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag de la versión, p. ej. v0.2.0 (debe existir en el repo del código)'
+        required: true
+      notes:
+        description: 'Notas de la versión'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: Aracari-Studios/aracari-app-global
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Tag no válido: $TAG"; exit 1; }
+          # Pre-release hasta que todo esté subido: así /releases/latest sigue apuntando a la versión anterior.
+          # (No usar drafts: las URLs de los assets en latest.json saldrían como «untagged-…».)
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$TAG" -f name="Aracari $TAG" -f body="$NOTES" -F prerelease=true --jq .id)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          - platform: windows-latest
+            args: ''
+            rust_targets: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          releaseBody: ${{ inputs.notes }}
+          args: ${{ matrix.args }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qx 'latest.json' \
+            || { echo "Falta latest.json: no se publica"; exit 1; }
+          # Ahora sí: estable y «latest», y el updater de las apps ya instaladas lo ve.
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F prerelease=false -f make_latest=true >/dev/null
+          echo "Publicado $TAG"
